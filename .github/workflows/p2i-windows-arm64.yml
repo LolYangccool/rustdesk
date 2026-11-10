@@ -1,0 +1,350 @@
+name: P2i Assistance - Windows ARM64
+
+# Client RustDesk personnalisé « P2i Assistance » pour Windows ARM64.
+# Compile RustDesk 1.5.1 (dépôt officiel rustdesk/rustdesk) en reprenant son job Windows arm64
+# (flutter-build.yml) et la personnalisation de RDGen. Seuls les fichiers p2i/ viennent de cette branche.
+# Résultat : release « p2i-arm64 ». En cas d'échec : release « p2i-arm64-log » avec la fin du journal.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - P2i
+      - p2i
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SCITER_RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_WINDOWS_ARM_VERSION: "3.44.9"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VERSION: "1.5.1"
+  RUSTDESK_REF: "1.5.1"
+  APP: "P2iAssistance"
+  FILENAME: "P2i-Assistance"
+
+jobs:
+  assets:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Générer icônes et logo
+        run: |
+          pip3 install pillow
+          python3 p2i/make_assets.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: p2i-assets
+          path: p2i-assets
+
+  # Pont Flutter/Rust généré depuis les sources 1.5.1 (copie du job Flutter 3.44 de bridge.yml 1.5.1)
+  generate-bridge:
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_EXPAND_VERSION: "1.0.95"
+      FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+      RUST_VERSION: "1.75"
+    steps:
+      - name: Checkout RustDesk ${{ env.RUSTDESK_REF }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.RUSTDESK_REF }}
+          submodules: recursive
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get install ca-certificates -y
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: p2i-bridge-ubuntu
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: "3.44.8"
+          cache: true
+
+      - name: Install flutter rust bridge deps
+        shell: bash
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+          bash .github/patches/apply_flutter_3.44_source_patches.sh
+          pushd flutter && flutter pub get && popd
+
+      - name: Run flutter rust bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-artifact-flutter-3.44
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  build-RustDeskTempTopMostWindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-11-arm
+      configuration: Release
+      platform: ARM64
+      target_version: Windows10
+
+  build-windows-arm64:
+    name: Windows ARM64
+    needs: [assets, generate-bridge, build-RustDeskTempTopMostWindow]
+    runs-on: windows-11-arm
+    env:
+      TARGET: aarch64-pc-windows-msvc
+      VCPKG_TRIPLET: arm64-windows-static
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout RustDesk ${{ env.RUSTDESK_REF }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.RUSTDESK_REF }}
+          submodules: recursive
+
+      - name: Checkout fichiers P2i
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: p2i-src
+          sparse-checkout: p2i
+
+      - name: Copier les fichiers P2i
+        shell: bash
+        run: cp -r p2i-src/p2i ./p2i && rm -rf p2i-src
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact-flutter-3.44
+          path: ./
+
+      - name: Restore P2i assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: p2i-assets
+          path: ./p2i-assets
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        id: flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_WINDOWS_ARM_VERSION }}
+          architecture: x64
+
+      - name: Force arm64 Dart SDK + engine
+        run: |
+          $flutterRoot = "${{ steps.flutter.outputs['CACHE-PATH'] }}"
+          Remove-Item -Force "$flutterRoot\bin\cache\engine-dart-sdk.stamp" -ErrorAction SilentlyContinue
+          & "$flutterRoot\bin\internal\update_dart_sdk.ps1"
+          $dartVer = & "$flutterRoot\bin\dart.bat" --version 2>&1 | Out-String
+          Write-Host $dartVer
+          if ($dartVer -notmatch "windows_arm64") {
+            Write-Error "Expected an arm64 Dart SDK but got: $dartVer"
+            exit 1
+          }
+          & "$flutterRoot\bin\flutter.bat" precache --windows
+          $engineDir = "$flutterRoot\bin\cache\artifacts\engine"
+          if (-not (Test-Path "$engineDir\windows-arm64-release")) {
+            Write-Error "windows-arm64-release engine artifacts missing"
+            exit 1
+          }
+
+      - name: Patch RustDesk sources for Flutter 3.44 (arm64)
+        shell: bash
+        run: bash .github/patches/apply_flutter_3.44_source_patches.sh
+
+      - name: Personnalisation P2i (sources)
+        shell: bash
+        run: |
+          python3 p2i/branding.py
+          cp -r p2i-assets/source/. ./
+          git -C . diff --stat | tail -5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: p2i-windows-11-arm
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+        shell: bash
+        run: |
+          if ! $VCPKG_ROOT/vcpkg install --triplet $VCPKG_TRIPLET --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do echo "$_1:"; tail -n 60 "$_1"; done
+            exit 1
+          fi
+
+      - name: Set SODIUM_LIB_DIR (arm64)
+        shell: bash
+        run: echo "SODIUM_LIB_DIR=$VCPKG_ROOT/installed/$VCPKG_TRIPLET/lib" >> "$GITHUB_ENV"
+
+      - name: Build rustdesk
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec
+          mv ./flutter/build/windows/arm64/runner/Release ./rustdesk
+
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk
+
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
+            $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+            $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
+            $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+            $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
+            if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
+                Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+                mkdir ./rustdesk/drivers
+                mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+                Expand-Archive printer_driver_adapter.zip -DestinationPath .
+                mv -Force .\printer_driver_adapter.dll ./rustdesk
+            }
+          } catch {
+              Write-Host "Ignore the printer driver error."
+          }
+
+      - name: Personnalisation P2i (dossier compilé)
+        shell: bash
+        run: |
+          cp -r p2i-assets/dist/. ./rustdesk/
+          cp p2i/custom_.txt ./rustdesk/custom_.txt
+          ls -l ./rustdesk/data/flutter_assets/assets/ | head -20
+
+      - name: find Runner.res
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res");
+          if [ "$runner_res" != "" ]; then cp $runner_res ./libs/portable/Runner.res; fi
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-ARM64
+          path: "./rustdesk"
+
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          mv "./rustdesk/rustdesk.exe" "./rustdesk/${APP}.exe"
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e "../../rustdesk/${APP}.exe"
+          popd
+          mkdir -p ./SignOutput
+          mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/${FILENAME}-arm64.exe"
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+        with:
+          msbuild-architecture: arm64
+
+      - name: Build msi
+        continue-on-error: true
+        run: |
+          pushd ./res/msi
+          python preprocess.py --app-name "${{ env.APP }}" --arp -d ../../rustdesk
+          nuget restore msi.sln
+          msbuild msi.sln -p:Configuration=Release -p:Platform=ARM64 /p:TargetVersion=Windows10
+          $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
+          mv $msi.FullName "../../SignOutput/${{ env.FILENAME }}-arm64.msi"
+          popd
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          tag_name: p2i-arm64
+          target_commitish: ${{ github.sha }}
+          name: P2i Assistance - Windows ARM64 (RustDesk ${{ env.VERSION }})
+          body: "Client RustDesk personnalisé P2i Assistance pour Windows ARM64 (rd.p2informatique.fr). Build ${{ github.run_id }}."
+          files: |
+            ./SignOutput/*.msi
+            ./SignOutput/*.exe
+
+  report-failure:
+    needs: [assets, generate-bridge, build-RustDeskTempTopMostWindow, build-windows-arm64]
+    if: failure()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Publier la fin du journal en échec
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e
+          echo "# Échec du build ${RUN_ID}" > body.md
+          gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=50" \
+            --jq '.jobs[] | select(.conclusion=="failure") | [.id, .name, ([.steps[] | select(.conclusion=="failure") | .name] | join(", "))] | @tsv' > failed.tsv
+          while IFS=$'\t' read -r id name step; do
+            echo "" >> body.md
+            echo "## Job : $name — étape : $step" >> body.md
+            echo '```' >> body.md
+            gh api "repos/$REPO/actions/jobs/$id/logs" | sed -E 's/^[0-9T:.-]+Z //' | grep -v '^\s*$' | tail -n 150 >> body.md
+            echo '```' >> body.md
+          done < failed.tsv
+          head -c 120000 body.md > body2.md
+          gh release delete p2i-arm64-log --yes --cleanup-tag -R "$REPO" 2>/dev/null
+          gh release create p2i-arm64-log -R "$REPO" --prerelease --target "${{ github.sha }}" \
+            --title "P2i ARM64 - journal d'échec (run $RUN_ID)" --notes-file body2.md
